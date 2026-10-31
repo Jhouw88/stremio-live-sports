@@ -1,7 +1,38 @@
 const { addonBuilder } = require('stremio-addon-sdk');
 const fetch = require('node-fetch').default || global.fetch || require('node-fetch');
 
-// Cache structures
+const DEFAULT_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Referer': 'https://streamed.pk/'
+};
+
+async function fetchJson(url, extraHeaders = {}) {
+  try {
+    const response = await fetch(url, {
+      headers: {
+        ...DEFAULT_HEADERS,
+        ...extraHeaders
+      }
+    });
+
+    const text = await response.text();
+    if (!text || !text.trim()) return [];
+
+    const trimmed = text.trim();
+    if (trimmed.startsWith('<')) {
+      console.warn(`[provider] HTML response received from ${url}. Source may be closed or blocked.`);
+      return [];
+    }
+
+    return JSON.parse(trimmed);
+  } catch (err) {
+    console.warn(`[provider] Failed to fetch JSON from ${url}:`, err.message || err);
+    return [];
+  }
+}
+
 const cache = {
   sports: [],
   sportsLastFetched: 0,
@@ -9,21 +40,22 @@ const cache = {
   matchesLastFetched: 0
 };
 
-const CACHE_TTL_SPORTS = 24 * 60 * 60 * 1000; // 24 hours
-const CACHE_TTL_MATCHES = 30 * 60 * 1000; // 30 minutes
+const CACHE_TTL_SPORTS = 24 * 60 * 60 * 1000;
+const CACHE_TTL_MATCHES = 30 * 60 * 1000;
 
 async function getSports() {
   if (Date.now() - cache.sportsLastFetched < CACHE_TTL_SPORTS && cache.sports.length > 0) {
     return cache.sports;
   }
+
   try {
-    const res = await fetch('https://streamed.pk/api/sports');
-    const data = await res.json();
-    cache.sports = data;
+    const data = await fetchJson('https://streamed.pk/api/sports');
+    const sports = Array.isArray(data) ? data : [];
+    cache.sports = sports;
     cache.sportsLastFetched = Date.now();
-    return data;
+    return sports;
   } catch (e) {
-    console.error("Error fetching sports:", e);
+    console.error('Error fetching sports:', e);
     return [];
   }
 }
@@ -32,39 +64,37 @@ async function getMatches() {
   if (Date.now() - cache.matchesLastFetched < CACHE_TTL_MATCHES && cache.matches.length > 0) {
     return cache.matches;
   }
+
   try {
-    const res = await fetch('https://streamed.pk/api/matches/all-today');
-    let data = await res.json();
-    
-    // Also fetch live
+    const allToday = await fetchJson('https://streamed.pk/api/matches/all-today');
+    let data = Array.isArray(allToday) ? allToday : [];
+
     try {
-      const liveRes = await fetch('https://streamed.pk/api/matches/live');
-      const liveData = await liveRes.json();
-      // add live data avoiding duplicates
-      for (const lm of liveData) {
+      const liveData = await fetchJson('https://streamed.pk/api/matches/live');
+      const liveMatches = Array.isArray(liveData) ? liveData : [];
+      for (const lm of liveMatches) {
         if (!data.find(m => m.id === lm.id)) {
           data.push(lm);
         }
       }
-    } catch(err) {
-      console.log("Error fetching live", err);
+    } catch (err) {
+      console.log('Error fetching live matches:', err.message || err);
     }
 
     cache.matches = data;
     cache.matchesLastFetched = Date.now();
     return data;
   } catch (e) {
-    console.error("Error fetching matches:", e);
+    console.error('Error fetching matches:', e);
     return [];
   }
 }
 
 async function buildManifest() {
   const sports = await getSports();
-  const genres = sports.map(s => s.name);
-  if (!genres.includes("All")) {
-    // Genres usually are used for filtering
-    genres.unshift("All");
+  const genres = sports.map(s => s.name).filter(Boolean);
+  if (!genres.includes('All')) {
+    genres.unshift('All');
   }
 
   return {
@@ -84,7 +114,7 @@ async function buildManifest() {
           {
             name: 'genre',
             isRequired: false,
-            options: genres
+            options: genres.length ? genres : ['All']
           }
         ]
       }
@@ -92,27 +122,26 @@ async function buildManifest() {
   };
 }
 
-// We'll create the builder initialization inside a factory since manifest is async
 const puppeteer = require('puppeteer');
 
 let browserPromise = null;
 async function getBrowser() {
   if (!browserPromise) {
-    browserPromise = puppeteer.launch({ 
+    browserPromise = puppeteer.launch({
       headless: 'new',
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath(),
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] 
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
     });
   }
   return browserPromise;
 }
 
-// Memory cache for extracted m3u8 URLs
 const resolvedStreamsCache = {};
 
 async function extractM3u8(embedUrl) {
+  if (!embedUrl) return null;
+
   if (resolvedStreamsCache[embedUrl]) {
-    // Cache for 2 hours (or until server restarts)
     if (Date.now() - resolvedStreamsCache[embedUrl].time < 2 * 60 * 60 * 1000) {
       return resolvedStreamsCache[embedUrl].m3u8;
     }
@@ -139,17 +168,18 @@ async function extractM3u8(embedUrl) {
 
     try {
       await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    } catch(e) {}
+    } catch (e) {}
 
     await Promise.race([m3u8Promise, timeoutPromise]);
-    await page.close().catch(()=>{});
+    await page.close().catch(() => {});
 
     if (m3u8Url) {
       resolvedStreamsCache[embedUrl] = { m3u8: m3u8Url, time: Date.now() };
     }
+
     return m3u8Url;
-  } catch(e) {
-    if (page) await page.close().catch(()=>{});
+  } catch (e) {
+    if (page) await page.close().catch(() => {});
     return null;
   }
 }
@@ -160,11 +190,11 @@ async function getAddon() {
 
   builder.defineCatalogHandler(async ({ type, id, extra }) => {
     if (type !== 'tv' || id !== 'strmpk_sports') return { metas: [] };
-    
+
     let matches = await getMatches();
-    
-    let genre = extra.genre;
-    if (genre && genre !== "All") {
+
+    const genre = extra && extra.genre;
+    if (genre && genre !== 'All') {
       const sports = await getSports();
       const sportId = sports.find(s => s.name === genre)?.id;
       if (sportId) {
@@ -178,7 +208,7 @@ async function getAddon() {
         description += `${match.teams.home.name} vs ${match.teams.away.name}\n`;
       }
       description += `Start Time: ${new Date(match.date).toLocaleString()}\n`;
-      description += `Sport: ${match.category.toUpperCase()}`;
+      description += `Sport: ${String(match.category || '').toUpperCase()}`;
 
       let poster = match.poster ? match.poster : (match.teams?.home?.badge || null);
       if (poster && poster.startsWith('/')) {
@@ -243,48 +273,47 @@ async function getAddon() {
 
     let allStreams = [];
 
-    // Fetch stream info for each source from streamed.pk
     for (const source of match.sources) {
       try {
-        const res = await fetch(`https://streamed.pk/api/stream/${source.source}/${source.id}`);
-        const streamData = await res.json();
-        allStreams.push(...streamData);
-      } catch (e) {}
+        const streamData = await fetchJson(`https://streamed.pk/api/stream/${source.source}/${source.id}`);
+        allStreams.push(...(Array.isArray(streamData) ? streamData : []));
+      } catch (e) {
+        console.log('Error fetching stream source', source, e.message || e);
+      }
     }
 
     const streams = [];
 
-    // To prevent Stremio from timing out, we only extract the first valid direct stream inline
     let extractedM3u8 = null;
-    let refererUrl = 'https://embedsports.top/'; // fallback
-    let bestStream = allStreams.find(s => s.embedUrl);
-    
+    let refererUrl = 'https://embedsports.top/';
+    const bestStream = allStreams.find(s => s && s.embedUrl);
+
     if (bestStream) {
       extractedM3u8 = await extractM3u8(bestStream.embedUrl);
       try {
         refererUrl = new URL(bestStream.embedUrl).origin + '/';
-      } catch(e){}
+      } catch (e) {}
     }
 
     for (const strm of allStreams) {
-      if (!strm.embedUrl) continue;
-      
+      if (!strm || !strm.embedUrl) continue;
+
       const isBestStream = (strm === bestStream);
       const title = `Direct Stream (${strm.language} ${strm.hd ? 'HD' : 'SD'}) [${strm.source.toUpperCase()}]`;
       const fallbackTitle = `Open in Browser (${strm.language} ${strm.hd ? 'HD' : 'SD'}) [${strm.source.toUpperCase()}]`;
 
       if (isBestStream && extractedM3u8) {
-         streams.push({
-          name: "Streamed (Direct)",
+        streams.push({
+          name: 'Streamed (Direct)',
           title: title,
           url: extractedM3u8,
           behaviorHints: {
             notWebReady: true,
             proxyHeaders: {
               request: {
-                "Referer": refererUrl,
-                "Origin": refererUrl,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                'Referer': refererUrl,
+                'Origin': refererUrl,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
               }
             }
           }
@@ -292,7 +321,7 @@ async function getAddon() {
       }
 
       streams.push({
-        name: "Streamed (Ext)",
+        name: 'Streamed (Ext)',
         title: fallbackTitle,
         externalUrl: strm.embedUrl
       });
