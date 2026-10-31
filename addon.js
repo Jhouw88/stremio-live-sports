@@ -1,7 +1,8 @@
 const { addonBuilder } = require('stremio-addon-sdk');
 const fetch = require('node-fetch').default || global.fetch || require('node-fetch');
 
-const API_BASE = 'https://www.thesportsdb.com/api/v1/json/123';
+const THESPORTSDB_BASE = 'https://www.thesportsdb.com/api/v1/json/123';
+const ERGAST_BASE = 'https://ergast.com/api/f1';
 
 const DEFAULT_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -22,7 +23,7 @@ async function fetchJson(url) {
 
     const trimmed = text.trim();
     if (trimmed.startsWith('<')) {
-      throw new Error(`Received HTML instead of JSON from ${url}`);
+      return {};
     }
 
     return JSON.parse(trimmed);
@@ -30,6 +31,24 @@ async function fetchJson(url) {
     console.warn(`[provider] Failed to fetch ${url}: ${err.message || err}`);
     return {};
   }
+}
+
+function toSafeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizeSportName(name) {
+  if (!name) return 'Other';
+  const lower = name.toLowerCase();
+  if (lower.includes('football') || lower.includes('soccer')) return 'Soccer';
+  if (lower.includes('formula') || lower.includes('f1')) return 'F1';
+  if (lower.includes('motorsport') || lower.includes('motor')) return 'Motorsport';
+  if (lower.includes('basket')) return 'Basketball';
+  if (lower.includes('baseball')) return 'Baseball';
+  if (lower.includes('cricket')) return 'Cricket';
+  if (lower.includes('tennis')) return 'Tennis';
+  if (lower.includes('rugby')) return 'Rugby';
+  return name;
 }
 
 const cache = {
@@ -47,29 +66,33 @@ async function getSports() {
     return cache.sports;
   }
 
-  const payload = await fetchJson(`${API_BASE}/all_sports.php`);
-  const sports = Array.isArray(payload.sports) ? payload.sports : [];
-  const normalized = sports
-    .map(s => ({
-      id: String(s.idSport || s.strSport || s.name || Math.random()),
-      name: s.strSport || s.name || 'Unknown'
-    }))
-    .filter(s => s.name && s.name !== 'Unknown');
+  const sportsPayload = await fetchJson(`${THESPORTSDB_BASE}/all_sports.php`);
+  const sports = toSafeArray(sportsPayload.sports);
 
-  cache.sports = normalized;
-  cache.sportsLastFetched = Date.now();
-  return normalized;
-}
+  const normalized = sports.map(s => ({
+    id: String(s.idSport || s.strSport || Math.random()),
+    name: normalizeSportName(s.strSport || s.name || 'Unknown')
+  })).filter(s => s.name && s.name !== 'Unknown');
 
-async function getMatches() {
-  if (Date.now() - cache.matchesLastFetched < CACHE_TTL_MATCHES && cache.matches.length > 0) {
-    return cache.matches;
+  const unique = [];
+  const seen = new Set();
+  for (const s of normalized) {
+    if (!seen.has(s.name)) {
+      seen.add(s.name);
+      unique.push(s);
+    }
   }
 
+  cache.sports = unique;
+  cache.sportsLastFetched = Date.now();
+  return unique;
+}
+
+async function getGeneralMatches() {
   const sports = await getSports();
-  const leagueData = await fetchJson(`${API_BASE}/all_leagues.php`);
-  const leagues = Array.isArray(leagueData.leagues) ? leagueData.leagues : [];
-  const matchList = [];
+  const leaguesPayload = await fetchJson(`${THESPORTSDB_BASE}/all_leagues.php`);
+  const leagues = toSafeArray(leaguesPayload.leagues);
+  const results = [];
   const seen = new Set();
 
   for (const sport of sports) {
@@ -81,8 +104,8 @@ async function getMatches() {
       .slice(0, 3);
 
     for (const leagueId of relevantLeagues) {
-      const payload = await fetchJson(`${API_BASE}/eventsnextleague.php?id=${leagueId}`);
-      const events = Array.isArray(payload.events) ? payload.events : [];
+      const payload = await fetchJson(`${THESPORTSDB_BASE}/eventsnextleague.php?id=${leagueId}`);
+      const events = toSafeArray(payload.events);
 
       for (const event of events) {
         const key = event.idEvent || `${event.idLeague || ''}-${event.strEvent || ''}`;
@@ -91,11 +114,12 @@ async function getMatches() {
         const homeTeam = event.strHomeTeam || 'Home';
         const awayTeam = event.strAwayTeam || 'Away';
         const match = {
-          id: String(event.idEvent || key),
+          id: `tdb_${event.idEvent || key}`,
           title: event.strEvent || `${homeTeam} vs ${awayTeam}`,
           date: event.dateEvent || event.date || event.strTimestamp || new Date().toISOString(),
-          category: String(sport.id),
+          category: sport.id,
           categoryName: sport.name,
+          sportKey: sport.name.toLowerCase(),
           poster: event.strThumb || event.strPoster || event.strEventThumb || null,
           teams: {
             home: { name: homeTeam, badge: event.strHomeTeamBadge || null },
@@ -110,42 +134,88 @@ async function getMatches() {
           ]
         };
 
-        matchList.push(match);
+        results.push(match);
         seen.add(key);
       }
     }
   }
 
-  cache.matches = matchList;
+  return results;
+}
+
+async function getF1Matches() {
+  const payload = await fetchJson(`${ERGAST_BASE}/current.json`);
+  const races = toSafeArray(payload.MRData?.RaceTable?.Races);
+
+  return races.map(race => ({
+    id: `f1_${race.season}_${race.round}`,
+    title: `${race.raceName}`,
+    date: race.date ? `${race.date}T${race.time || '00:00:00Z'}` : new Date().toISOString(),
+    category: 'f1',
+    categoryName: 'F1',
+    sportKey: 'f1',
+    poster: null,
+    teams: {
+      home: { name: race.Circuit?.circuitName || 'Circuit', badge: null },
+      away: { name: race.season || 'F1', badge: null }
+    },
+    sources: [
+      {
+        source: 'search',
+        id: `f1_${race.season}_${race.round}`,
+        embedUrl: `https://www.google.com/search?q=${encodeURIComponent(`${race.raceName} live stream`)}`
+      }
+    ]
+  }));
+}
+
+async function getMatches() {
+  if (Date.now() - cache.matchesLastFetched < CACHE_TTL_MATCHES && cache.matches.length > 0) {
+    return cache.matches;
+  }
+
+  const generalMatches = await getGeneralMatches();
+  const f1Matches = await getF1Matches();
+  const combined = [...generalMatches, ...f1Matches];
+
+  const deduped = [];
+  const seen = new Set();
+  for (const match of combined) {
+    if (!seen.has(match.id)) {
+      deduped.push(match);
+      seen.add(match.id);
+    }
+  }
+
+  cache.matches = deduped;
   cache.matchesLastFetched = Date.now();
-  return matchList;
+  return deduped;
 }
 
 async function buildManifest() {
   const sports = await getSports();
   const genres = sports.map(s => s.name);
-  if (!genres.includes('All')) {
-    genres.unshift('All');
-  }
+  if (!genres.includes('All')) genres.unshift('All');
+  if (!genres.includes('F1')) genres.push('F1');
 
   return {
-    id: 'org.thesportsdb.sports',
+    id: 'org.sports.replacement',
     version: '1.0.0',
-    name: 'TheSportsDB Live Sports',
-    description: 'Live sports metadata backed by TheSportsDB with browser fallback links.',
+    name: 'Multi-Sport Live Catalog',
+    description: 'Live sports metadata from public APIs with browser fallback streams.',
     resources: ['catalog', 'meta', 'stream'],
     types: ['tv'],
-    idPrefixes: ['tstdb_'],
+    idPrefixes: ['sports_'],
     catalogs: [
       {
         type: 'tv',
-        id: 'tstdb_sports',
+        id: 'sports_catalog',
         name: 'Live Sports',
         extra: [
           {
             name: 'genre',
             isRequired: false,
-            options: genres.length ? genres : ['All']
+            options: genres
           }
         ]
       }
@@ -220,16 +290,15 @@ async function getAddon() {
   const builder = new addonBuilder(manifest);
 
   builder.defineCatalogHandler(async ({ type, id, extra }) => {
-    if (type !== 'tv' || id !== 'tstdb_sports') return { metas: [] };
+    if (type !== 'tv' || id !== 'sports_catalog') return { metas: [] };
 
     let matches = await getMatches();
     const genre = extra && extra.genre;
     if (genre && genre !== 'All') {
-      const sports = await getSports();
-      const sportId = sports.find(s => s.name === genre)?.id;
-      if (sportId) {
-        matches = matches.filter(m => m.category === sportId);
-      }
+      matches = matches.filter(match => {
+        if (genre === 'F1') return match.categoryName === 'F1' || match.sportKey === 'f1';
+        return match.categoryName === genre || match.sportKey === genre.toLowerCase();
+      });
     }
 
     const metas = matches.map(match => {
@@ -242,11 +311,11 @@ async function getAddon() {
 
       let poster = match.poster || (match.teams?.home?.badge || null);
       if (poster && poster.startsWith('/')) {
-        poster = 'https://www.thesportsdb.com' + poster;
+        poster = `https://www.thesportsdb.com${poster}`;
       }
 
       return {
-        id: 'tstdb_' + match.id,
+        id: 'sports_' + match.id,
         type: 'tv',
         name: match.title,
         posterShape: 'landscape',
@@ -259,10 +328,10 @@ async function getAddon() {
   });
 
   builder.defineMetaHandler(async ({ type, id }) => {
-    if (type !== 'tv' || !id.startsWith('tstdb_')) return { meta: {} };
+    if (type !== 'tv' || !id.startsWith('sports_')) return { meta: {} };
 
     const matches = await getMatches();
-    const matchId = id.replace('tstdb_', '');
+    const matchId = id.replace('sports_', '');
     const match = matches.find(m => m.id === matchId);
     if (!match) return { meta: {} };
 
@@ -275,7 +344,7 @@ async function getAddon() {
 
     let poster = match.poster || (match.teams?.home?.badge || null);
     if (poster && poster.startsWith('/')) {
-      poster = 'https://www.thesportsdb.com' + poster;
+      poster = `https://www.thesportsdb.com${poster}`;
     }
 
     return {
@@ -292,10 +361,10 @@ async function getAddon() {
   });
 
   builder.defineStreamHandler(async ({ type, id }) => {
-    if (type !== 'tv' || !id.startsWith('tstdb_')) return { streams: [] };
+    if (type !== 'tv' || !id.startsWith('sports_')) return { streams: [] };
 
     const matches = await getMatches();
-    const matchId = id.replace('tstdb_', '');
+    const matchId = id.replace('sports_', '');
     const match = matches.find(m => m.id === matchId);
     if (!match || !match.sources) return { streams: [] };
 
