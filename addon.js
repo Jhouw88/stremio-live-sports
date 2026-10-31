@@ -1,11 +1,11 @@
 const { addonBuilder } = require('stremio-addon-sdk');
 const fetch = require('node-fetch').default || global.fetch || require('node-fetch');
 
+const API_BASE = 'https://www.thesportsdb.com/api/v1/json/123';
 const DEFAULT_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
   'Accept': 'application/json, text/plain, */*',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'Referer': 'https://streamed.pk/'
+  'Accept-Language': 'en-US,en;q=0.9'
 };
 
 async function fetchJson(url, extraHeaders = {}) {
@@ -17,19 +17,23 @@ async function fetchJson(url, extraHeaders = {}) {
       }
     });
 
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`HTTP ${response.status} for ${url}: ${text.slice(0, 200)}`);
+    }
+
     const text = await response.text();
-    if (!text || !text.trim()) return [];
+    if (!text || !text.trim()) return {};
 
     const trimmed = text.trim();
     if (trimmed.startsWith('<')) {
-      console.warn(`[provider] HTML response received from ${url}. Source may be closed or blocked.`);
-      return [];
+      throw new Error(`Received HTML instead of JSON from ${url}`);
     }
 
     return JSON.parse(trimmed);
   } catch (err) {
-    console.warn(`[provider] Failed to fetch JSON from ${url}:`, err.message || err);
-    return [];
+    console.warn(`[provider] Failed to fetch ${url}:`, err.message || err);
+    return {};
   }
 }
 
@@ -49,15 +53,41 @@ async function getSports() {
   }
 
   try {
-    const data = await fetchJson('https://streamed.pk/api/sports');
-    const sports = Array.isArray(data) ? data : [];
-    cache.sports = sports;
+    const data = await fetchJson(`${API_BASE}/all_sports.php`);
+    const sports = Array.isArray(data.sports) ? data.sports : [];
+    const normalized = sports.map(s => ({
+      id: String(s.idSport || s.strSport || s.name || Math.random()),
+      name: s.strSport || s.name || 'Unknown'
+    }));
+
+    cache.sports = normalized;
     cache.sportsLastFetched = Date.now();
-    return sports;
+    return normalized;
   } catch (e) {
     console.error('Error fetching sports:', e);
     return [];
   }
+}
+
+async function getLeagueIdsBySport(sports) {
+  const leaguesData = await fetchJson(`${API_BASE}/all_leagues.php`);
+  const leagues = Array.isArray(leaguesData.leagues) ? leaguesData.leagues : [];
+  const result = new Map();
+
+  for (const sport of sports) {
+    const sportName = sport.name.toLowerCase();
+    const leagueIds = leagues
+      .filter(l => (l.strSport || '').toLowerCase() === sportName)
+      .map(l => Number(l.idLeague))
+      .filter(Boolean)
+      .slice(0, 3);
+
+    if (leagueIds.length > 0) {
+      result.set(sport.id, leagueIds);
+    }
+  }
+
+  return result;
 }
 
 async function getMatches() {
@@ -66,24 +96,59 @@ async function getMatches() {
   }
 
   try {
-    const allToday = await fetchJson('https://streamed.pk/api/matches/all-today');
-    let data = Array.isArray(allToday) ? allToday : [];
+    const sports = await getSports();
+    const leagueIdsBySport = await getLeagueIdsBySport(sports);
+    const matchList = [];
+    const seen = new Set();
 
-    try {
-      const liveData = await fetchJson('https://streamed.pk/api/matches/live');
-      const liveMatches = Array.isArray(liveData) ? liveData : [];
-      for (const lm of liveMatches) {
-        if (!data.find(m => m.id === lm.id)) {
-          data.push(lm);
+    for (const [sportId, leagueIds] of leagueIdsBySport.entries()) {
+      for (const leagueId of leagueIds) {
+        const data = await fetchJson(`${API_BASE}/eventsnextleague.php?id=${leagueId}`);
+        const events = Array.isArray(data.events) ? data.events : [];
+
+        for (const event of events) {
+          const key = event.idEvent || `${event.idLeague || ''}-${event.strEvent || ''}`;
+          if (!key || seen.has(key)) continue;
+
+          const sportName = event.strSport || sports.find(s => s.id === sportId)?.name || 'Unknown';
+          const homeName = event.strHomeTeam || 'Home';
+          const awayName = event.strAwayTeam || 'Away';
+
+          const match = {
+            id: String(event.idEvent || key),
+            title: event.strEvent || `${homeName} vs ${awayName}`,
+            date: event.dateEvent || event.date || event.strTimestamp || new Date().toISOString(),
+            category: String(sportId),
+            categoryName: sportName,
+            poster: event.strThumb || event.strPoster || event.strEventThumb || null,
+            teams: {
+              home: {
+                name: homeName,
+                badge: event.strHomeTeamBadge || null
+              },
+              away: {
+                name: awayName,
+                badge: event.strAwayTeamBadge || null
+              }
+            },
+            sources: [
+              {
+                source: 'search',
+                id: String(event.idEvent || key),
+                embedUrl: `https://www.google.com/search?q=${encodeURIComponent(`${homeName} ${awayName} live stream`)}`
+              }
+            ]
+          };
+
+          matchList.push(match);
+          seen.add(key);
         }
       }
-    } catch (err) {
-      console.log('Error fetching live matches:', err.message || err);
     }
 
-    cache.matches = data;
+    cache.matches = matchList;
     cache.matchesLastFetched = Date.now();
-    return data;
+    return matchList;
   } catch (e) {
     console.error('Error fetching matches:', e);
     return [];
@@ -98,17 +163,17 @@ async function buildManifest() {
   }
 
   return {
-    id: 'org.streamedpk.sports',
+    id: 'org.thesportsdb.sports',
     version: '1.0.0',
-    name: 'Streamed Live Sports',
-    description: 'Watch live sports from streamed.pk with direct stream extraction.',
+    name: 'TheSportsDB Live Sports',
+    description: 'Live sports metadata backed by TheSportsDB with browser fallback links.',
     resources: ['catalog', 'meta', 'stream'],
     types: ['tv'],
-    idPrefixes: ['strmpk_'],
+    idPrefixes: ['tstdb_'],
     catalogs: [
       {
         type: 'tv',
-        id: 'strmpk_sports',
+        id: 'tstdb_sports',
         name: 'Live Sports',
         extra: [
           {
@@ -189,7 +254,7 @@ async function getAddon() {
   const builder = new addonBuilder(manifest);
 
   builder.defineCatalogHandler(async ({ type, id, extra }) => {
-    if (type !== 'tv' || id !== 'strmpk_sports') return { metas: [] };
+    if (type !== 'tv' || id !== 'tstdb_sports') return { metas: [] };
 
     let matches = await getMatches();
 
@@ -198,7 +263,7 @@ async function getAddon() {
       const sports = await getSports();
       const sportId = sports.find(s => s.name === genre)?.id;
       if (sportId) {
-        matches = matches.filter(m => m.category === sportId);
+        matches = matches.filter(m => m.category === String(sportId));
       }
     }
 
@@ -208,15 +273,15 @@ async function getAddon() {
         description += `${match.teams.home.name} vs ${match.teams.away.name}\n`;
       }
       description += `Start Time: ${new Date(match.date).toLocaleString()}\n`;
-      description += `Sport: ${String(match.category || '').toUpperCase()}`;
+      description += `Sport: ${match.categoryName || 'Unknown'}`;
 
-      let poster = match.poster ? match.poster : (match.teams?.home?.badge || null);
+      let poster = match.poster || (match.teams?.home?.badge || null);
       if (poster && poster.startsWith('/')) {
-        poster = 'https://streamed.pk' + poster;
+        poster = 'https://www.thesportsdb.com' + poster;
       }
 
       return {
-        id: 'strmpk_' + match.id,
+        id: 'tstdb_' + match.id,
         type: 'tv',
         name: match.title,
         posterShape: 'landscape',
@@ -229,10 +294,10 @@ async function getAddon() {
   });
 
   builder.defineMetaHandler(async ({ type, id }) => {
-    if (type !== 'tv' || !id.startsWith('strmpk_')) return { meta: {} };
+    if (type !== 'tv' || !id.startsWith('tstdb_')) return { meta: {} };
 
     const matches = await getMatches();
-    const matchId = id.replace('strmpk_', '');
+    const matchId = id.replace('tstdb_', '');
     const match = matches.find(m => m.id === matchId);
 
     if (!match) return { meta: {} };
@@ -242,11 +307,11 @@ async function getAddon() {
       description += `${match.teams.home.name} vs ${match.teams.away.name}\n`;
     }
     description += `Start: ${new Date(match.date).toLocaleString()}\n`;
-    description += `Sport: ${match.category}`;
+    description += `Sport: ${match.categoryName || 'Unknown'}`;
 
-    let poster = match.poster ? match.poster : (match.teams?.home?.badge || null);
+    let poster = match.poster || (match.teams?.home?.badge || null);
     if (poster && poster.startsWith('/')) {
-      poster = 'https://streamed.pk' + poster;
+      poster = 'https://www.thesportsdb.com' + poster;
     }
 
     return {
@@ -263,48 +328,35 @@ async function getAddon() {
   });
 
   builder.defineStreamHandler(async ({ type, id }) => {
-    if (type !== 'tv' || !id.startsWith('strmpk_')) return { streams: [] };
+    if (type !== 'tv' || !id.startsWith('tstdb_')) return { streams: [] };
 
     const matches = await getMatches();
-    const matchId = id.replace('strmpk_', '');
+    const matchId = id.replace('tstdb_', '');
     const match = matches.find(m => m.id === matchId);
 
     if (!match || !match.sources) return { streams: [] };
 
-    let allStreams = [];
-
-    for (const source of match.sources) {
-      try {
-        const streamData = await fetchJson(`https://streamed.pk/api/stream/${source.source}/${source.id}`);
-        allStreams.push(...(Array.isArray(streamData) ? streamData : []));
-      } catch (e) {
-        console.log('Error fetching stream source', source, e.message || e);
-      }
-    }
-
     const streams = [];
-
     let extractedM3u8 = null;
-    let refererUrl = 'https://embedsports.top/';
-    const bestStream = allStreams.find(s => s && s.embedUrl);
+    let refererUrl = 'https://www.google.com/';
+    const bestStream = match.sources.find(s => s && s.embedUrl);
 
-    if (bestStream) {
+    if (bestStream && bestStream.embedUrl && bestStream.embedUrl.startsWith('http')) {
       extractedM3u8 = await extractM3u8(bestStream.embedUrl);
       try {
         refererUrl = new URL(bestStream.embedUrl).origin + '/';
       } catch (e) {}
     }
 
-    for (const strm of allStreams) {
-      if (!strm || !strm.embedUrl) continue;
+    for (const source of match.sources) {
+      if (!source || !source.embedUrl) continue;
 
-      const isBestStream = (strm === bestStream);
-      const title = `Direct Stream (${strm.language} ${strm.hd ? 'HD' : 'SD'}) [${strm.source.toUpperCase()}]`;
-      const fallbackTitle = `Open in Browser (${strm.language} ${strm.hd ? 'HD' : 'SD'}) [${strm.source.toUpperCase()}]`;
+      const isBestStream = source === bestStream;
+      const title = `Search stream (${source.source.toUpperCase()})`;
 
       if (isBestStream && extractedM3u8) {
         streams.push({
-          name: 'Streamed (Direct)',
+          name: 'Search (Direct)',
           title: title,
           url: extractedM3u8,
           behaviorHints: {
@@ -321,9 +373,9 @@ async function getAddon() {
       }
 
       streams.push({
-        name: 'Streamed (Ext)',
-        title: fallbackTitle,
-        externalUrl: strm.embedUrl
+        name: 'Search Stream',
+        title: title,
+        externalUrl: source.embedUrl
       });
     }
 
